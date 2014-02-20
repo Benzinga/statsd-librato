@@ -2,7 +2,7 @@
 
 This is an implementation of Etsy's StatsD written in Go that submits data to Librato Metrics.
 
-This was forked from [jbuchbinder/statsd-go](https://github.com/jbuchbinder/statsd-go) and altered to provide support for Librato as a submission backend.
+This was forked from [jcoene/statsd-go](https://github.com/jcoene/statsd-go) Librato server and altered to provide support for percentiles for timers.
 
 # Usage
 
