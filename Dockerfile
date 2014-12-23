@@ -1,9 +1,9 @@
-FROM mischief/docker-golang
+FROM golang:1.3
 
-MAINTAINER Timehop <tech@timehop.com>
+MAINTAINER Ian Blenke <ian@blenke.com>
 
-RUN go get github.com/timehop/statsd-librato
+RUN go get github.com/ianblenke/statsd-librato
 
 EXPOSE 8125
 
-ENTRYPOINT ["/root/go/bin/statsd-librato"]
+ENTRYPOINT ["/go/bin/statsd-librato"]
