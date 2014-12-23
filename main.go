@@ -19,6 +19,8 @@ import (
 	"time"
 )
 
+const VERSION = "0.1.4"
+
 type Packet struct {
 	Bucket   string
 	Value    string
@@ -27,17 +29,18 @@ type Packet struct {
 }
 
 var log *logger.Logger
-var sanitizeRegexp = regexp.MustCompile("[^a-zA-Z0-9\\-_\\.:\\|@]")
-var packetRegexp = regexp.MustCompile("([a-zA-Z0-9_\\.]+):(\\-?[0-9\\.]+)\\|(c|ms|g)(\\|@([0-9\\.]+))?")
+var sanitizeRegexp = regexp.MustCompile("[^a-zA-Z0-9\\-_\\.,:\\|@]")
+var packetRegexp = regexp.MustCompile("([a-zA-Z0-9_\\.,]+):(\\-?[0-9\\.]+)\\|(c|ms|g)(\\|@([0-9\\.]+))?")
 
 var (
-	serviceAddress = flag.String("address", "0.0.0.0:8125", "UDP service address")
-	libratoUser    = flag.String("user", "", "Librato Username")
-	libratoToken   = flag.String("token", "", "Librato API Token")
-	libratoSource  = flag.String("source", "", "Librato Source")
-	flushInterval  = flag.Int64("flush", 60, "Flush Interval (seconds)")
-	percentiles    = flag.String("percentiles", "", "List of Percentiles to Calculate with timers")
-	debug          = flag.Bool("debug", false, "Enable Debugging")
+	serviceAddress = flag.String("address", "0.0.0.0:8125", "udp listen address")
+	libratoUser    = flag.String("user", "", "librato api username (LIBRATO_USER)")
+	libratoToken   = flag.String("token", "", "librato api token (LIBRATO_TOKEN)")
+	libratoSource  = flag.String("source", "", "librato api source (LIBRATO_SOURCE)")
+	flushInterval  = flag.Int64("flush", 60, "interval at which data is sent to librato (in seconds)")
+	percentiles    = flag.String("percentiles", "", "comma separated list of percentiles to calculate for timers (eg. \"95,99.5\")")
+	debug          = flag.Bool("debug", false, "enable logging of inputs and submissions")
+	version        = flag.Bool("version", false, "print version and exit")
 )
 
 var (
@@ -58,17 +61,20 @@ func (m *Measurement) Count() int {
 }
 
 type Counter struct {
-	Name  string `json:"name"`
-	Value int64  `json:"value"`
+	Name   string  `json:"name"`
+	Source *string `json:"source,omitempty"`
+	Value  int64   `json:"value"`
 }
 
 type SimpleGauge struct {
-	Name  string  `json:"name"`
-	Value float64 `json:"value"`
+	Name   string  `json:"name"`
+	Source *string `json:"source,omitempty"`
+	Value  float64 `json:"value"`
 }
 
 type ComplexGauge struct {
 	Name       string  `json:"name"`
+	Source     *string `json:"source,omitempty"`
 	Count      int     `json:"count"`
 	Sum        float64 `json:"sum"`
 	Min        float64 `json:"min"`
@@ -114,6 +120,15 @@ func monitor() {
 	}
 }
 
+func parseBucket(bucket string) (string, *string) {
+	if strings.Contains(bucket, ",") {
+		ss := strings.SplitN(bucket, ",", 2)
+		return ss[1], &ss[0]
+	}
+
+	return bucket, nil
+}
+
 func submit() (err error) {
 	m := new(Measurement)
 	if *libratoSource != "" {
@@ -124,14 +139,14 @@ func submit() (err error) {
 
 	for k, v := range counters {
 		c := new(Counter)
-		c.Name = k
+		c.Name, c.Source = parseBucket(k)
 		c.Value = v
 		m.Counters = append(m.Counters, *c)
 	}
 
 	for k, v := range gauges {
 		g := new(SimpleGauge)
-		g.Name = k
+		g.Name, g.Source = parseBucket(k)
 		g.Value = v
 		m.Gauges = append(m.Gauges, *g)
 	}
@@ -140,16 +155,19 @@ func submit() (err error) {
 		g := gaugePercentile(k, t, 100.0, "")
 		m.Gauges = append(m.Gauges, *g)
 
-		pcts := strings.Split(*percentiles, ",")
-		for _, pct := range pcts {
-			pctf, err := strconv.ParseFloat(pct, 64)
-			if err != nil {
-				log.Warn("error parsing %s as float: %s", pct, m.Count(), err)
-				continue
-			}
+		if *percentiles != "" {
+			pcts := strings.Split(*percentiles, ",")
+			for _, pct := range pcts {
+				pctf, err := strconv.ParseFloat(pct, 64)
+				if err != nil {
+					log.Warn("error parsing '%s' as float: %s", pct, err)
+					continue
+				}
 
-			g = gaugePercentile(k, t, pctf, "pct"+pct)
-			m.Gauges = append(m.Gauges, *g)
+				if g = gaugePercentile(k, t, pctf, pct); g != nil {
+					m.Gauges = append(m.Gauges, *g)
+				}
+			}
 		}
 	}
 
@@ -166,6 +184,9 @@ func submit() (err error) {
 	log.Debug("sending payload:\n%s", payload)
 
 	req, err := http.NewRequest("POST", "https://metrics-api.librato.com/v1/metrics", bytes.NewBuffer(payload))
+
+	req.Close = true
+
 	if err != nil {
 		return
 	}
@@ -202,11 +223,11 @@ func gaugePercentile(k string, t []float64, pct float64, suffix string) *Complex
 	}
 
 	g := new(ComplexGauge)
-	g.Count = numInPct
-	g.Name = k
+	g.Name, g.Source = parseBucket(k)
 	if suffix != "" {
 		g.Name += "." + suffix
 	}
+	g.Count = numInPct
 
 	if g.Count > 0 {
 		sort.Float64s(t)
@@ -217,13 +238,13 @@ func gaugePercentile(k string, t []float64, pct float64, suffix string) *Complex
 			g.Sum += v
 			g.SumSquares += (v * v)
 		}
-	}
 
-	mid := g.Count / 2
-	if g.Count%2 == 0 {
+		mid := g.Count / 2
 		g.Median = t[mid]
-	} else {
-		g.Median = t[mid] + t[mid-1]
+
+		if g.Count > 2 && g.Count%2 == 0 {
+			g.Median += t[mid-1]
+		}
 	}
 
 	return g
@@ -271,9 +292,13 @@ func listen() {
 	for {
 		message := make([]byte, 512)
 		n, remaddr, error := listener.ReadFrom(message)
+
 		if error != nil {
 			continue
 		}
+
+		log.Debug("received metric: %s", message)
+
 		buf := bytes.NewBuffer(message[0:n])
 		go handle(listener, remaddr, buf)
 	}
@@ -282,12 +307,42 @@ func listen() {
 func main() {
 	flag.Parse()
 
+	if *version {
+		fmt.Printf("statsd-librato v%s\n", VERSION)
+		return
+	}
+
 	if *debug {
 		log = logger.NewLogger(logger.LOG_LEVEL_DEBUG, "statsd")
 	} else {
 		log = logger.NewLogger(logger.LOG_LEVEL_INFO, "statsd")
 	}
 
+	if *libratoUser == "" {
+		if !getEnv(libratoUser, "LIBRATO_USER") {
+			log.Fatal("specify a librato user with -user or the LIBRATO_USER environment variable")
+		}
+	}
+
+	if *libratoToken == "" {
+		if !getEnv(libratoToken, "LIBRATO_TOKEN") {
+			log.Fatal("specify a librato token with -token or the LIBRATO_TOKEN environment variable")
+		}
+	}
+
+	if *libratoSource == "" {
+		getEnv(libratoSource, "LIBRATO_SOURCE")
+	}
+
 	go listen()
 	monitor()
+}
+
+func getEnv(p *string, key string) bool {
+	if s := os.Getenv(key); s != "" {
+		*p = s
+		return true
+	}
+
+	return false
 }
